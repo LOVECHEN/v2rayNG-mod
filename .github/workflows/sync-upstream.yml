@@ -1,0 +1,233 @@
+name: Sync upstream and release
+
+on:
+  schedule:
+    # 每 6 小时检查一次 (UTC 0:00, 6:00, 12:00, 18:00)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check upstream latest release
+      id: check
+      run: |
+        # 获取上游最新 release（包括 prerelease）
+        UPSTREAM_RELEASE=$(curl -s https://api.github.com/repos/2dust/v2rayNG/releases | jq '.[0]')
+        UPSTREAM_TAG=$(echo "$UPSTREAM_RELEASE" | jq -r '.tag_name')
+        echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+        echo "上游最新版: $UPSTREAM_TAG"
+
+        if [ "$UPSTREAM_TAG" == "null" ] || [ -z "$UPSTREAM_TAG" ]; then
+          echo "无法获取上游 release 信息"
+          echo "skip=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # 提取 release body 和 prerelease 状态
+        UPSTREAM_BODY=$(echo "$UPSTREAM_RELEASE" | jq -r '.body // ""')
+        UPSTREAM_PRERELEASE=$(echo "$UPSTREAM_RELEASE" | jq -r '.prerelease')
+        echo "upstream_prerelease=$UPSTREAM_PRERELEASE" >> $GITHUB_OUTPUT
+
+        # body 可能含多行，用文件传递
+        echo "$UPSTREAM_BODY" > /tmp/release_body.txt
+        echo "上游 prerelease: $UPSTREAM_PRERELEASE"
+
+        # 检查 mod 仓库是否已有该版本的 release
+        MOD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/tags/$UPSTREAM_TAG")
+
+        if [ "$MOD_STATUS" == "200" ]; then
+          echo "Mod 仓库已有 $UPSTREAM_TAG release，跳过"
+          echo "skip=true" >> $GITHUB_OUTPUT
+        else
+          echo "发现新版本 $UPSTREAM_TAG，开始同步"
+          echo "skip=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checkout mod repo
+      if: steps.check.outputs.skip != 'true'
+      uses: actions/checkout@v6.0.2
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Sync upstream code
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+
+        # 备份 mod 仓库的 .github 目录（避免被上游覆盖）
+        cp -r .github /tmp/.github-backup
+
+        # 添加上游 remote
+        git remote add upstream https://github.com/2dust/v2rayNG.git || true
+        git fetch upstream --tags --force
+
+        # 配置 git
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # reset 到上游 tag 对应的 commit
+        git reset --hard "$UPSTREAM_TAG"
+
+        # 初始化 submodules
+        git submodule update --init --recursive
+
+        # 恢复 mod 仓库的 .github 目录
+        rm -rf .github
+        cp -r /tmp/.github-backup .github
+        echo "✅ 已恢复 mod 仓库的 .github 目录"
+
+    - name: Remove promotion and redirect updates to mod repo
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        python3 << 'PYTHON_SCRIPT'
+        import os, re
+
+        def read_file(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.readlines()
+
+        def write_file(path, lines):
+            with open(path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+
+        def remove_lines_containing(lines, text):
+            return [line for line in lines if text not in line]
+
+        def replace_in_lines(lines, old, new):
+            return [line.replace(old, new) for line in lines]
+
+        def remove_xml_item(lines, item_id):
+            """Remove an XML <item> block containing the given id."""
+            result = []
+            skip = False
+            for line in lines:
+                if item_id in line:
+                    while result and '<item' not in result[-1]:
+                        result.pop()
+                    if result and '<item' in result[-1]:
+                        result.pop()
+                    skip = True
+                    if '/>' in line:
+                        skip = False
+                    continue
+                if skip:
+                    if '/>' in line or '</item>' in line:
+                        skip = False
+                    continue
+                result.append(line)
+            return result
+
+        operations = {
+            'V2rayNG/app/src/main/java/com/v2ray/ang/AppConfig.kt': [
+                # 删除推广 URL
+                ('remove_lines', 'APP_PROMOTION_URL'),
+                # 更新检查指向 mod 仓库
+                ('replace', '2dust/v2rayNG', 'LOVECHEN/v2rayNG-mod'),
+            ],
+            'V2rayNG/app/src/main/java/com/v2ray/ang/ui/MainActivity.kt': [
+                # 只删推广，保留检查更新
+                ('remove_lines', 'R.id.promotion'),
+            ],
+            'V2rayNG/app/src/main/res/menu/menu_drawer.xml': [
+                # 只删推广菜单项，保留检查更新
+                ('remove_xml_item', 'android:id="@+id/promotion"'),
+            ],
+        }
+
+        success = 0
+        total = len(operations)
+
+        for rel_path, ops in operations.items():
+            if not os.path.exists(rel_path):
+                print(f"文件不存在，跳过: {rel_path}")
+                continue
+            try:
+                lines = read_file(rel_path)
+                for op in ops:
+                    op_type = op[0]
+                    if op_type == 'remove_lines':
+                        lines = remove_lines_containing(lines, op[1])
+                    elif op_type == 'replace':
+                        lines = replace_in_lines(lines, op[1], op[2])
+                    elif op_type == 'remove_xml_item':
+                        lines = remove_xml_item(lines, op[1])
+                write_file(rel_path, lines)
+                success += 1
+                print(f"✅ {rel_path}")
+            except Exception as e:
+                print(f"❌ {rel_path}: {e}")
+
+        print(f"\n处理完成: {success}/{total}")
+        PYTHON_SCRIPT
+
+    - name: Commit and push
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+
+        git add -A
+        git commit -m "Sync upstream $UPSTREAM_TAG - Remove promotions"
+        git push --force origin master
+
+        # 创建对应的 tag
+        git tag -f "$UPSTREAM_TAG"
+        git push --force origin "$UPSTREAM_TAG"
+
+    - name: Create release with upstream info
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+        UPSTREAM_PRERELEASE="${{ steps.check.outputs.upstream_prerelease }}"
+
+        export UPSTREAM_TAG UPSTREAM_PRERELEASE
+        python3 << 'PYEOF'
+        import json, os
+
+        upstream_body = open('/tmp/release_body.txt').read().strip()
+
+        body = upstream_body
+
+        payload = {
+            'tag_name': os.environ['UPSTREAM_TAG'],
+            'target_commitish': 'master',
+            'name': '',
+            'body': body,
+            'draft': False,
+            'prerelease': os.environ['UPSTREAM_PRERELEASE'] == 'true'
+        }
+        with open('/tmp/release_payload.json', 'w') as f:
+            json.dump(payload, f)
+        PYEOF
+
+        echo "预创建 release $UPSTREAM_TAG (prerelease=$UPSTREAM_PRERELEASE)"
+        curl -X POST \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases" \
+          -d @/tmp/release_payload.json
+
+        echo "✅ Release 已创建，信息与上游一致"
+
+    - name: Trigger build workflow
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        UPSTREAM_TAG="${{ steps.check.outputs.upstream_tag }}"
+
+        echo "触发 build.yml，release_tag=$UPSTREAM_TAG"
+        curl -X POST \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
+          -d '{"ref":"master","inputs":{"release_tag":"'"$UPSTREAM_TAG"'"}}'
+
+        echo "✅ 构建已触发，版本: $UPSTREAM_TAG"

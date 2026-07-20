@@ -129,4 +129,4 @@ jobs:
         file: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/*/release/*.apk
         tag: ${{ github.event.inputs.release_tag }}
         file_glob: true
-        prerelease: true
+        prerelease: false

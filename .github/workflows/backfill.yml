@@ -1,0 +1,170 @@
+name: Backfill release APK
+
+# 一次性/按需补建历史版本的去广告 APK 并上传到对应 release。
+# 与 build.yml 的区别：checkout 的是【上游 pristine tag】，再就地打去广告补丁
+# （与 sync-upstream.yml 完全一致的删除逻辑），然后走同样的构建链、上传到 mod 同名 release。
+# 用途：修复历史上因去广告脚本失效而 build 失败、导致 asset 缺失的 release。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '上游 tag（同时也是要上传到的 mod release），如 2.3.5'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout upstream at tag
+      uses: actions/checkout@v6
+      with:
+        repository: '2dust/v2rayNG'
+        ref: ${{ github.event.inputs.tag }}
+        submodules: 'recursive'
+        fetch-depth: '0'
+
+    - name: Remove promotion and redirect updates to mod repo
+      run: |
+        python3 << 'PYTHON_SCRIPT'
+        import os
+
+        def read_file(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.readlines()
+
+        def write_file(path, lines):
+            with open(path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+
+        def remove_lines_containing(lines, text):
+            return [line for line in lines if text not in line]
+
+        def replace_in_lines(lines, old, new):
+            return [line.replace(old, new) for line in lines]
+
+        # 铁律：绝不删除仍被引用的声明（常量/枚举项），否则会留下悬空引用炸编译。
+        # 只改仓库地址 + 从抽屉菜单展示列表移除推广入口；任一目标找不到即静默跳过。
+        # 兼容两种历史结构：2.3.3+ 的 MainDestination 枚举、2.3.1~2.3.2 的字符串路由。
+        operations = {
+            'V2rayNG/app/src/main/java/com/v2ray/ang/AppConfig.kt': [
+                ('replace', '2dust/v2rayNG', 'LOVECHEN/v2rayNG-mod'),
+            ],
+            'V2rayNG/app/src/main/java/com/v2ray/ang/ui/main/MainDrawer.kt': [
+                ('remove_lines', 'MainDestination.Promotion'),
+                ('remove_lines', 'DrawerMenuItemData(R.drawable.ic_promotion_24dp'),
+            ],
+        }
+
+        success = 0
+        total = len(operations)
+
+        for rel_path, ops in operations.items():
+            if not os.path.exists(rel_path):
+                print(f"文件不存在，跳过: {rel_path}")
+                continue
+            try:
+                lines = read_file(rel_path)
+                for op in ops:
+                    if op[0] == 'remove_lines':
+                        lines = remove_lines_containing(lines, op[1])
+                    elif op[0] == 'replace':
+                        lines = replace_in_lines(lines, op[1], op[2])
+                write_file(rel_path, lines)
+                success += 1
+                print(f"✅ {rel_path}")
+            except Exception as e:
+                print(f"❌ {rel_path}: {e}")
+
+        print(f"\n处理完成: {success}/{total}")
+        PYTHON_SCRIPT
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3.2.0
+      with:
+        log-accepted-android-sdk-licenses: false
+        cmdline-tools-version: '13114758'
+        packages: 'platforms;android-36.1 build-tools;36.1.0 platform-tools'
+
+    - name: Install NDK
+      run: |
+        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          --channel=0 \
+          --install "ndk;28.2.13676358"
+        echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+        sed -i '10i\
+        \
+            ndkVersion = "28.2.13676358"' ${{ github.workspace }}/V2rayNG/app/build.gradle.kts
+
+    - name: Restore cached libhevtun
+      id: cache-libhevtun-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ github.workspace }}/libs
+        key: libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('.git/modules/hev-socks5-tunnel/HEAD') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+    - name: Build libhevtun
+      if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+      run: |
+        bash compile-hevtun.sh
+
+    - name: Save libhevtun
+      if: steps.cache-libhevtun-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ github.workspace }}/libs
+        key: libhevtun-${{ runner.os }}-${{ env.NDK_HOME }}-${{ hashFiles('.git/modules/hev-socks5-tunnel/HEAD') }}-${{ hashFiles('compile-hevtun.sh') }}
+
+    - name: Copy libhevtun
+      run: |
+        cp -r ${{ github.workspace }}/libs ${{ github.workspace }}/V2rayNG/app
+
+    - name: Fetch AndroidLibXrayLite tag
+      run: |
+        pushd AndroidLibXrayLite
+        CURRENT_TAG=$(git describe --tags --abbrev=0)
+        echo "Current tag in this repo: $CURRENT_TAG"
+        echo "CURRENT_TAG=$CURRENT_TAG" >> $GITHUB_ENV
+        popd
+
+    - name: Download libv2ray
+      uses: robinraju/release-downloader@v1.12
+      with:
+        repository: '2dust/AndroidLibXrayLite'
+        tag: ${{ env.CURRENT_TAG }}
+        fileName: 'libv2ray.aar'
+        out-file-path: V2rayNG/app/libs/
+
+    - name: Setup Java
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Decode Keystore
+      uses: timheuer/base64-to-file@v1.2.4
+      id: android_keystore
+      with:
+        fileName: "android_keystore.jks"
+        encodedString: ${{ secrets.APP_KEYSTORE_BASE64 }}
+
+    - name: Build APK
+      run: |
+        cd ${{ github.workspace }}/V2rayNG
+        echo "sdk.dir=${ANDROID_HOME}" > local.properties
+        chmod 755 gradlew
+        ./gradlew licenseFdroidReleaseReport
+        ./gradlew assembleRelease -Pandroid.injected.signing.store.file=${{ steps.android_keystore.outputs.filePath }} -Pandroid.injected.signing.store.password=${{ secrets.APP_KEYSTORE_PASSWORD }} -Pandroid.injected.signing.key.alias=${{ secrets.APP_KEYSTORE_ALIAS }} -Pandroid.injected.signing.key.password=${{ secrets.APP_KEY_PASSWORD }}
+
+    - name: Upload to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        file: ${{ github.workspace }}/V2rayNG/app/build/outputs/apk/*/release/*.apk
+        tag: ${{ github.event.inputs.tag }}
+        file_glob: true
+        prerelease: false

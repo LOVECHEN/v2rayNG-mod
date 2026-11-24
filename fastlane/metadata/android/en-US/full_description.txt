@@ -15,7 +15,7 @@
 <li>possible to use third party dat file in the same folder, like <a href="https://guide.v2fly.org/routing/sitedata.html#%E5%A4%96%E7%BD%AE%E7%9A%84%E5%9F%9F%E5%90%8D%E6%96%87%E4%BB%B6">h2y</a></li>
 </ul>
 
-<h3>More in our <a href="https://github.com/2dust/v2rayNG/wiki">wiki</a></h3>
+<h3>More in our <a href="https://github.com/LOVECHEN/v2rayNG-mod/wiki">wiki</a></h3>
 
 <h3>Development guide</h3>
 
